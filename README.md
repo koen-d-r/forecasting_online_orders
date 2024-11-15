@@ -1,9 +1,9 @@
 In this file, a forecast for the expected number of online orders is generated for the next 364 days. This process runs weekly on Monday morning, where our logistics colleagues have a fresh numbers on the start of their workweek.
 
-**Blokker calendar**
+**Blokker calendar**\
 A Blokker calendar is being used, where each year has 364 days with a leap year every 7 to 8 years. This leap year contains one extra week. Using 364 days per year has the benefit of having exactly 52 weeks, 13 periods and 4 quarters, each of the exact same length.
 
-**Holidays**
+**Holidays**\
 A separate table with holidays us being maintained, with days like Christmas, Easter and other local holidays. In some cases, there is a pretty major impact on the number of online orders
 
 **Magazines**
