@@ -1,0 +1,163 @@
+-- first select dates as base table
+-- join magazine dates, holiday dates (e.g. Tweede Pinksterdag) for both this year and last year
+-- therefore four left joins!
+
+WITH cte_date AS (SELECT Datum AS date_ty,
+[Zelfde Dag VJ] AS date_ly,
+BlokkerKalenderNumeriekJaar AS bl_year,
+BlokkerKalenderNumeriekWeek AS bl_week,
+DATENAME(WEEKDAY, Datum) AS day_name,
+CASE WHEN CAST(Datum AS DATE) >= CAST(GETDATE() AS DATE) THEN 'true' ELSE 'false' END AS to_forecast,
+
+CASE WHEN holidays.dc_closed IS NULL AND DATENAME(WEEKDAY, Datum) = 'Saturday' THEN 'true'
+WHEN holidays.dc_closed IS NULL THEN 'false'
+ELSE holidays.dc_closed END AS dc_closed,
+
+holidays.key_holiday AS holiday_ty,
+holidays_ly.key_holiday AS holiday_ly,
+
+magazines.[key_edition] + ', ' + magazines.[day] AS magazine_ty,
+magazines_ly.[key_edition] + ', ' + magazines_ly.[day] AS magazine_ly
+
+FROM [gold].[vwDim_Date]
+
+-- left join with holidays for this year
+LEFT JOIN (SELECT [key_date],
+[key_holiday], 
+[dc_closed]
+FROM [import].[fact_holidays]) AS holidays ON Datum = holidays.key_date
+
+-- left join with holidays for last year
+LEFT JOIN (SELECT [key_date],
+[key_holiday], 
+[dc_closed]
+FROM [import].[fact_holidays]) AS holidays_ly ON [Zelfde Dag VJ] = holidays_ly.key_date
+
+-- left join with magazines for this year
+LEFT JOIN (SELECT [key_date], [key_channel], [key_edition], [day] 
+FROM [import].[fact_magazines]) AS magazines ON Datum = magazines.key_date
+
+-- left join with magazines for this year
+LEFT JOIN (SELECT [key_date], [key_channel], [key_edition], [day] 
+FROM [import].[fact_magazines]) AS magazines_ly ON [Zelfde Dag VJ] = magazines_ly.key_date
+
+WHERE CAST(Datum AS DATE) >= CAST('2021-01-01' AS DATE) AND CAST(Datum AS DATE) < DATEADD(DAY, 363, GETDATE())),
+
+
+-- create a orders table as cte_orders
+cte_orders AS (SELECT CAST([Order Datum] as date) as order_date,
+COUNT(DISTINCT [Order Nummer]) orders,
+[key_holiday],
+[dc_closed],
+[edition]
+FROM [gold].[vwFact_Transactions_and_Returns]
+
+-- left join with holidays
+LEFT JOIN (SELECT [key_date],
+[key_holiday], 
+[dc_closed]
+FROM [import].[fact_holidays]) AS holidays ON CAST([Order Datum] as date) = CAST(holidays.key_date AS date)
+
+-- left join with magazines
+LEFT JOIN (SELECT [key_date], [key_edition] + ', ' +  [day] AS edition
+FROM [import].[fact_magazines]) AS magazines ON CAST([Order Datum] as date) = CAST(magazines.key_date AS date)
+
+where retourvlag = 'Geen Retour' AND
+[voorraad locatie] = 'GEL - DC' AND
+[order regel type] not in ('ShippingCosts', 'HandlingCosts', 'Commission') AND
+CAST([Order Datum] as date) >= '2023-01-01'
+
+GROUP BY CAST([Order Datum] as date), holidays.key_holiday, holidays.dc_closed, magazines.edition),
+
+
+-- join the dates table and the orders table in a new table
+cte_raw AS (SELECT cte_date.*,
+orders_ty.orders AS orders_ty,
+orders_ly.orders AS orders_ly,
+
+orders_holidays.orders AS orders_holiday_ly,
+
+orders_magazine.orders AS orders_magazine_ly,
+
+avg_orders_28d.avg_orders_28d,
+
+
+-- calculate growth trends over last 28 days (4 weeks) and the same period last year
+AVG(orders_ty.orders) OVER(ORDER BY cte_date.date_ty ROWS BETWEEN 27 PRECEDING AND CURRENT ROW) AS r_avg_28d_ty,
+AVG(orders_ly.orders) OVER(ORDER BY cte_date.date_ly ROWS BETWEEN 27 PRECEDING AND CURRENT ROW) AS r_avg_28d_ly,
+
+-- calculate growth trends over last 91 days (13 weeks) and the same period last year
+AVG(orders_ty.orders) OVER(ORDER BY cte_date.date_ty ROWS BETWEEN 90 PRECEDING AND CURRENT ROW) AS r_avg_91d_ty,
+AVG(orders_ly.orders) OVER(ORDER BY cte_date.date_ly ROWS BETWEEN 90 PRECEDING AND CURRENT ROW) AS r_avg_91d_ly,
+
+-- calculate growth trends over last 364 days (52 weeks) and the same period last year
+AVG(orders_ty.orders) OVER(ORDER BY cte_date.date_ty ROWS BETWEEN 363 PRECEDING AND CURRENT ROW) AS r_avg_364d_ty,
+AVG(orders_ly.orders) OVER(ORDER BY cte_date.date_ly ROWS BETWEEN 363 PRECEDING AND CURRENT ROW) AS r_avg_364d_ly
+
+FROM cte_date
+-- grab this years orders
+LEFT JOIN cte_orders AS orders_ty ON orders_ty.order_date = cte_date.date_ty
+
+-- grab last years orders
+LEFT JOIN cte_orders AS orders_ly ON orders_ly.order_date = cte_date.date_ly
+
+-- grab the orders of last years holiday, e.g. Koningsdag last year
+LEFT JOIN (SELECT key_holiday, orders FROM cte_orders
+WHERE order_date IN (SELECT MAX(order_date) FROM cte_orders WHERE key_holiday IS NOT NULL GROUP BY key_holiday)) AS orders_holidays ON cte_date.holiday_ty = orders_holidays.key_holiday
+
+-- grab the orders of last years magazine for each day, e.g. magazine mei/juni, dag 7
+LEFT JOIN (SELECT edition, orders FROM cte_orders
+WHERE order_date IN (SELECT MAX(order_date) FROM cte_orders WHERE edition IS NOT NULL
+GROUP BY edition)) AS orders_magazine ON orders_magazine.edition = cte_date.magazine_ty
+
+-- grab average per day of the week for last 28 days (e.g. Monday)
+LEFT JOIN (SELECT DATENAME(WEEKDAY, order_date) AS day_name,
+SUM([orders]) / 4 AS avg_orders_28d
+FROM cte_orders
+WHERE order_date >= DATEADD(DAY, -28, GETDATE()) AND order_date < GETDATE()
+GROUP BY DATENAME(WEEKDAY, order_date)) AS avg_orders_28d ON avg_orders_28d.day_name = cte_date.day_name),
+
+-- calculate the average trend by taking the average of the rolling averages with lookback windows of 28, 91 and 364 days
+cte_trend AS (SELECT ((r_avg_28d_ty + r_avg_91d_ty + r_avg_364d_ty) - (r_avg_28d_ly + r_avg_91d_ly + r_avg_364d_ly)) / CAST((r_avg_28d_ly + r_avg_91d_ly + r_avg_364d_ly) AS FLOAT) AS trend
+FROM cte_raw WHERE date_ty = CAST(DATEADD(DAY, -1, GETDATE()) AS DATE)),
+
+cte_forecast AS (SELECT 
+cte_raw.date_ty,
+cte_raw.date_ly,
+cte_raw.bl_year,
+cte_raw.bl_week,
+cte_raw.day_name,
+cte_raw.to_forecast,
+cte_raw.dc_closed,
+cte_raw.holiday_ty,
+cte_raw.holiday_ly,
+cte_raw.magazine_ty,
+cte_raw.magazine_ly,
+cte_raw.orders_ty,
+cte_raw.orders_ly,
+cte_raw.orders_holiday_ly,
+cte_raw.orders_magazine_ly,
+cte_raw.avg_orders_28d,
+(SELECT * FROM cte_trend) AS trend,
+
+-- actual calculation of the forecast
+-- if holiday, then holiday last year plus trend
+CASE WHEN to_forecast = 'true' AND orders_holiday_ly IS NOT NULL THEN CAST(orders_holiday_ly * (1 + (SELECT * FROM cte_trend)) AS INT)
+-- if magazine, then magazine last year plus trend
+WHEN to_forecast = 'true' AND orders_magazine_ly IS NOT NULL THEN CAST(orders_magazine_ly * (1 + (SELECT * FROM cte_trend)) AS INT)
+-- if month equals January or December, then last year plus trend
+WHEN to_forecast = 'true' AND MONTH(cte_raw.date_ty) IN (1, 12) THEN CAST(cte_raw.orders_ly * (1 + (SELECT * FROM cte_trend)) AS INT)
+-- else (and this is the majority): average of orders last year and rolling average in the last 28 days plus trend
+WHEN to_forecast = 'true' THEN CAST(((cte_raw.orders_ly + cte_raw.avg_orders_28d) / 2) * (1 + (SELECT * FROM cte_trend)) AS INT)
+ELSE 0 END AS forecast
+
+FROM cte_raw)
+
+-- shift forecast with up to two days
+-- this query does not work properly if DC is closed for more than two days (three or more)
+SELECT *,
+CASE WHEN dc_closed = 'true' THEN 0
+WHEN LAG(cte_forecast.dc_closed, 2) OVER (ORDER BY date_ty) = 'true' AND LAG(cte_forecast.dc_closed, 1) OVER (ORDER BY date_ty) = 'true' THEN SUM(forecast) OVER (PARTITION BY date_ty ORDER BY date_ty ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+WHEN LAG(cte_forecast.dc_closed, 1) OVER (ORDER BY date_ty) = 'true' THEN SUM(forecast) OVER (ORDER BY date_ty ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+ELSE forecast END AS shifted_forecast
+FROM cte_forecast
